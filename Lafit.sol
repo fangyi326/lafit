@@ -1,3 +1,9 @@
+/**
+ * 
+ * author: email: fangyi.mr@qq.com   vx: 734647690 
+ * 
+ * */
+ 
 pragma solidity ^0.5.10;
 
 contract IToken{
