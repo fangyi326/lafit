@@ -43,12 +43,11 @@ contract Lafit{
     bool isPartner;
   }
 
-
   IToken token;
   address owner;
 
   uint256  internal decimal = 10 ** 6;
-  uint256[10] internal INVESTMENT_STALL = [200 * decimal,500 * decimal,1000 * decimal,2000 * decimal,5000 * decimal,10000 * decimal,20000 * decimal,50000 * decimal,100000 * decimal,200000 * decimal];
+  uint256 internal MIN_INVESTMENT = 200 * decimal;
 
   uint256 constant public BASE_PERCENT = 10;
   uint256 constant public DIRECT_BONUS_PERCENT = 100;
@@ -59,6 +58,7 @@ contract Lafit{
   uint256 constant public PARTNER_FEE = 50;
   uint256 constant public PERCENTS_DIVIDER = 1000;
   uint256  public CONTRACT_BALANCE_STEP = 2000000 * decimal;
+  uint256  public CONTRACT_BALANCE_STEP_SECOND = 5000000 * decimal;
   uint256 constant public TIME_STEP = 1 days;
 
   uint256 public totalUsers;
@@ -75,6 +75,7 @@ contract Lafit{
   uint40 public pool_last_draw = uint40(block.timestamp);
   uint256 public pool_cycle;
   uint256 public pool_balance;
+  uint256 public pool_balance_total;
   mapping(uint256 => mapping(address => uint256)) public pool_users_refs_deposits_sum;
   mapping(uint8 => address) public pool_top;
 
@@ -85,7 +86,7 @@ contract Lafit{
   uint40 public partnerLastAssessment = uint40(block.timestamp);
 
 
-  event Newbie(address user);
+  event NewUser(address user);
   event RefBonus(address up,address _addr,uint256 bonus);
   event NewDeposit(address indexed user, uint256 amount);
   event Withdrawn(address indexed user, uint256 amount);
@@ -102,23 +103,26 @@ contract Lafit{
     pool_bonuses.push(20);
     pool_bonuses.push(10);
   }
-
+  function() external payable{}
 
   function invest(address _upline,uint256 amount) public {
-    require(isInINVESTMENT_STALL(amount),'The investment amount is wrong');
+    require(amount >= MIN_INVESTMENT,'The investment amount is wrong');
+    if(totalInvested < (1e7 * decimal)){
+      require(amount <= (1e4 * decimal) ,'The investment amount must be less than 10,000');
+    }
+    if(totalInvested >=(1e7 * decimal) && totalInvested< (2e7 * decimal)){
+      require(amount <= (5e4 * decimal) ,'The investment amount must be less than 50,000');
+    }
     require(!isActive(msg.sender),'Deposit already exists');
     require(token.balanceOf(msg.sender) >= amount, 'Your balance is insufficient');
-
     User storage user = users[msg.sender];
     if(user.deposits.length>0){
       Deposit memory d = user.deposits[user.deposits.length-1];
       require(amount >d.amount ,'The investment amount must be greater than the last time');
     }
-
-
     uint256 tt = amount.mul(POOL_PERCENT).div(PERCENTS_DIVIDER);
-    bool res = token.transferFrom(msg.sender,address(this), tt);
     token.transferFrom(msg.sender,adminAddr, amount.sub(tt));
+    bool res = token.transferFrom(msg.sender,address(this), tt);
     require(res,'transferFrom excute faild');
 
     if (user.upline == address(0) && users[_upline].deposits.length > 0 && _upline != msg.sender) {
@@ -136,11 +140,11 @@ contract Lafit{
       users[up].referrals++;
 
       for(uint8 i = 0; i < REFERRAL_PERCENTS.length; i++) {
-        if(_upline == address(0)) break;
-        users[_upline].totalStructure++;
-        _upline = users[_upline].upline;
+        if(up == address(0)) break;
+        users[up].totalStructure++;
+        up = users[up].upline;
       }
-      emit Newbie(msg.sender);
+      emit NewUser(msg.sender);
     }
 
     user.deposits.push(Deposit(amount, 0, block.timestamp));
@@ -157,10 +161,10 @@ contract Lafit{
     if(pool_last_draw + TIME_STEP < block.timestamp) {
       drawPool();
     }
-    partnerPoolBalance += (amount * 5/100);
     if(partnerLastBonus + (10*60*60) < block.timestamp){
       drawPartnerBonus();
     }
+    partnerPoolBalance += (amount * 5/100);
     emit NewDeposit(msg.sender, amount);
   }
 
@@ -245,8 +249,9 @@ contract Lafit{
 
   function pollDeposits(address _addr, uint256 _amount) private {
     pool_balance += _amount * 24 / 1000;
-
-    address upline = users[_addr].upline;
+    pool_balance_total += pool_balance;
+    User memory user = users[_addr];
+    address upline = user.upline;
 
     if(upline == address(0)) return;
 
@@ -323,47 +328,62 @@ contract Lafit{
     }
   }
 
-  function withdraw() public {
+  function withdraw() public returns (bool){
+    if(pool_last_draw + TIME_STEP < block.timestamp) {
+      drawPool();
+    }
+    if(partnerLastBonus + (10*60*60) < block.timestamp){
+      drawPartnerBonus();
+    }
     User storage user = users[msg.sender];
+    require(user.deposits.length>0,'you have not invested');
     Deposit storage deposit = user.deposits[user.deposits.length-1];
     uint256 maxPayOut = deposit.amount.mul(3);
     require( deposit.withdrawn < maxPayOut, "User has no dividends");
     uint256 userPercentRate = getUserPercentRate();
 
     uint256 totalAmount;
-    uint256 dividends;
-    //static
-    dividends =  (deposit.amount.mul(userPercentRate).div(PERCENTS_DIVIDER))
+    uint256 dividends =  (deposit.amount.mul(userPercentRate).div(PERCENTS_DIVIDER))
     .mul(block.timestamp.sub(user.checkpoint))
     .div(TIME_STEP);
-    if((deposit.withdrawn + dividends)>=maxPayOut){
-      dividends = maxPayOut.sub((deposit.withdrawn));
+    if((deposit.withdrawn + dividends)>maxPayOut){
+      dividends = maxPayOut.sub(deposit.withdrawn);
+    }
+    if(dividends > 0){
+      deposit.withdrawn += dividends;
+      totalAmount += dividends;
       refBonus(msg.sender,dividends);
-      totalAmount = totalAmount.add(dividends);
-    }else{
-      uint256 referralBonus = getUserReferralBonus(msg.sender);
-      if((deposit.withdrawn + dividends + referralBonus)>=maxPayOut){
-        referralBonus =  maxPayOut.sub((deposit.withdrawn + dividends ));
-        user.bonus = user.bonus.sub(referralBonus);
-        totalAmount = totalAmount.add(referralBonus);
-      }else{
-        uint256 directBonus = user.directBonus;
-        if((deposit.withdrawn + dividends + referralBonus + directBonus)>=maxPayOut){
-          directBonus = maxPayOut.sub((deposit.withdrawn + dividends + referralBonus));
-          user.directBonus = user.directBonus.sub(directBonus);
-          totalAmount = totalAmount.add(directBonus);
-        }else{
-          uint256 poolBonus = user.poolBonus;
-          if((deposit.withdrawn + dividends + referralBonus + directBonus + poolBonus) >= maxPayOut){
-            poolBonus = maxPayOut.sub(deposit.withdrawn + dividends + referralBonus + directBonus);
-            user.poolBonus = user.poolBonus.sub(poolBonus);
-            totalAmount = totalAmount.add(poolBonus);
-          }
-        }
-      }
     }
 
-    deposit.withdrawn = deposit.withdrawn.add(totalAmount);
+    if(deposit.withdrawn < maxPayOut && user.directBonus>0){
+      uint256 directBonus = user.directBonus;
+      if(deposit.withdrawn + directBonus > maxPayOut){
+        directBonus = maxPayOut - deposit.withdrawn;
+      }
+      user.directBonus -= directBonus;
+      deposit.withdrawn +=  directBonus;
+      totalAmount +=  directBonus;
+    }
+
+    if(deposit.withdrawn < maxPayOut && user.bonus >0){
+      uint256 bonus = user.bonus;
+      if(deposit.withdrawn + bonus >maxPayOut){
+        bonus = maxPayOut - deposit.withdrawn;
+      }
+      user.bonus -= bonus;
+      deposit.withdrawn +=  bonus;
+      totalAmount +=  bonus;
+    }
+
+    if(deposit.withdrawn < maxPayOut && user.poolBonus >0){
+      uint256  poolBonus = user.poolBonus;
+      if(deposit.withdrawn + poolBonus> maxPayOut){
+        poolBonus = maxPayOut - deposit.withdrawn;
+      }
+      user.poolBonus -= poolBonus;
+      deposit.withdrawn +=  poolBonus;
+      totalAmount +=  poolBonus;
+    }
 
     if(user.isPartner && user.partnerBonus > 0){
       totalAmount += user.partnerBonus;
@@ -379,13 +399,7 @@ contract Lafit{
       partnerRealese = user.partnerAmount.sub(user.partnerWithdrawn);
     }
     user.partnerWithdrawn += partnerRealese;
-    totalAmount.add(partnerRealese);
-
-
-    uint256 poolBalance = getPoolBalance();
-    if (poolBalance < totalAmount) {
-      totalAmount = poolBalance;
-    }
+    totalAmount = totalAmount.add(partnerRealese);
 
     bool res = token.transfer(msg.sender,totalAmount);
     require(res,'withdraw failed');
@@ -393,9 +407,8 @@ contract Lafit{
     totalWithdrawn = totalWithdrawn.add(totalAmount);
     user.checkpoint = block.timestamp;
     emit Withdrawn(msg.sender, totalAmount);
-
+    return true;
   }
-
 
   function getUserDividends(address userAddress) public view returns (uint256) {
     User storage user = users[userAddress];
@@ -436,8 +449,12 @@ contract Lafit{
     return users[userAddress].directBonus;
   }
 
-  function getUserAvailableBalanceForWithdrawal(address userAddress) public view returns(uint256) {
+  function userUnWithdraw(address userAddress) public view returns(uint256 data) {
     User storage user = users[userAddress];
+    if(user.deposits.length==0){
+      return 0;
+    }
+
     Deposit storage deposit = user.deposits[user.deposits.length-1];
     uint256 maxPayOut = deposit.amount.mul(3);
 
@@ -473,7 +490,7 @@ contract Lafit{
   }
 
   function getUserTotalInvestAndWithdrawnForDeposits(address userAddress) public view returns(uint8,uint256,uint256) {
-    User storage user = users[userAddress];
+    User memory user = users[userAddress];
     uint256 totalAmountForDeposits;
     uint256 totalWithdrawnForDeposits;
     for (uint256 i = 0; i < user.deposits.length; i++) {
@@ -483,6 +500,24 @@ contract Lafit{
     return (uint8(user.deposits.length),totalAmountForDeposits,totalWithdrawnForDeposits);
   }
 
+  function userInfo1(address _addr) view external returns (uint256 checkpoint,address upline,uint256 referrals,uint256 totalStructure){
+    User memory user = users[_addr];
+    return (user.checkpoint,user.upline,user.referrals,user.totalStructure);
+  }
+
+  function userInfo2(address _addr) view external returns (uint256 poolBonus,uint256 directBonus,uint256 partnerBonus,uint256 threeLevelPerformance,uint256 userTotalWithdraw){
+    User memory user = users[_addr];
+    return (user.poolBonus,user.directBonus,user.partnerBonus,user.threeLevelPerformance,user.userTotalWithdraw);
+  }
+
+  function userInfo3(address _addr) view external returns (uint256 bonus,uint256 partnerBonusTotal,uint256 partnerAmount,uint256 partnerWithdrawn,bool isPartner){
+    User memory user = users[_addr];
+    return (user.bonus,user.partnerBonusTotal,user.partnerAmount,user.partnerWithdrawn,user.isPartner);
+  }
+
+  function contractInfo() view external returns (uint256 _totalUsers,uint256 _totalInvested,uint256 _totalWithdrawn,uint256 _totalDeposits,uint256 _pool_last_draw,uint256 _pool_balance,uint256 _pool_balance_total,uint256 _topReffer){
+    return (totalUsers,totalInvested,totalWithdrawn,totalDeposits,pool_last_draw,pool_balance,pool_balance_total,pool_users_refs_deposits_sum[pool_cycle][pool_top[0]]);
+  }
 
   function addPartner(address addr,uint8 type_big1small2) public onlyOwner returns (bool){
     require(users[addr].deposits.length != 0,' this address is not in users');
@@ -539,33 +574,27 @@ contract Lafit{
 
   }
 
-
-
   function isContract(address addr) internal view returns (bool) {
     uint size;
     assembly { size := extcodesize(addr) }
     return size > 0;
   }
 
-  function  isInINVESTMENT_STALL(uint256 a ) private view  returns(bool){
-
-    for(uint8 i=0;i<INVESTMENT_STALL.length;i++){
-      if(INVESTMENT_STALL[i]==a){
-        return true;
-      }
-    }
-    return false;
-  }
-
-  function getPoolBalance() public view returns (uint256) {
+  function getPoolBalance() internal view returns (uint256) {
     return totalInvested <= totalWithdrawn?0:totalInvested.sub(totalWithdrawn);
   }
 
   function getUserPercentRate() public view returns (uint256) {
     uint256 contractBalance = getPoolBalance();
-    if(contractBalance>(1e7 * decimal)){
+    if(contractBalance>(1e7 * decimal) && contractBalance<(5e7 * decimal) ){
       uint256 f = contractBalance.sub(1e7 * decimal);
       uint256 m =  (f+ CONTRACT_BALANCE_STEP -1 )/CONTRACT_BALANCE_STEP;
+      m = m<=90 ? m :90;
+      return BASE_PERCENT.add(m);
+    }
+    if(contractBalance > (5e7 * decimal) ){
+      uint256 f = contractBalance.sub(5e7 * decimal);
+      uint256 m =  (f+ CONTRACT_BALANCE_STEP_SECOND -1 )/CONTRACT_BALANCE_STEP_SECOND;
       m = m<=90 ? m :90;
       return BASE_PERCENT.add(m);
     }
